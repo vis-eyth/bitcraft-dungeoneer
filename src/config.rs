@@ -3,16 +3,11 @@ use bindings::sdk::{DbConnectionBuilder, __codegen::SpacetimeModule};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Default)]
 pub struct Config {
     cluster_url: String,
     region:      String,
     token:       String,
-}
-impl Default for Config {
-    fn default() -> Self {
-        Self { cluster_url: String::default(), region: String::default(), token: String::default() }
-    }
 }
 impl Config {
     pub fn from(path: &str) -> Result<Self> {
