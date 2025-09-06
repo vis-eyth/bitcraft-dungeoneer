@@ -55,31 +55,24 @@ async fn main() {
 }
 
 async fn consume(ctx: Arc<DbConnection>, mut rx: UnboundedReceiver<DbUpdate>) {
-    let handle = subscribe(ctx.clone(),[
+    let handle = subscribe(ctx.clone(), [
         "SELECT * FROM dungeon_state;",
-        concat!("SELECT n.* FROM dimension_network_state n",
-                " JOIN dungeon_state d ON n.entity_id = d.entity_id;"),
-        concat!("SELECT p.* FROM portal_state p",
-                " JOIN location_state l ON p.entity_id = l.entity_id;"),
-        concat!("SELECT l.* FROM location_state l",
-                " JOIN portal_state p ON l.entity_id = p.entity_id;"),
+        "SELECT p.* FROM portal_state p JOIN location_state l ON p.entity_id = l.entity_id;",
+        "SELECT l.* FROM location_state l JOIN portal_state p ON l.entity_id = p.entity_id;",
+        "SELECT n.* FROM dimension_network_state n JOIN dungeon_state d ON n.entity_id = d.entity_id;",
     ]);
-
     let Some(update) = rx.recv().await else {return};
     let _ = handle.unsubscribe();
 
     let (mut dungeons, lookup) = build_dungeons(update);
 
-    let mut queries = Vec::new();
-    queries.extend([
-        "SELECT * FROM player_username_state;",
-        concat!("SELECT n.* FROM dimension_network_state n",
-                " JOIN dungeon_state d ON n.entity_id = d.entity_id;"),
-    ].into_queries());
-    queries.extend(lookup.keys()
-        .map(|dim| format!("SELECT * FROM mobile_entity_state WHERE dimension = {};", dim))
-        .collect::<Vec<_>>()
-        .into_queries());
+    let mut queries = vec![
+        "SELECT * FROM player_username_state;".to_string(),
+        "SELECT n.* FROM dimension_network_state n JOIN dungeon_state d ON n.entity_id = d.entity_id;".to_string(),
+    ];
+    for dim in lookup.keys() {
+        queries.push(format!("SELECT * FROM mobile_entity_state WHERE dimension = {};", dim))
+    }
     subscribe(ctx.clone(), queries);
 
     let mut players = HashMap::new();
