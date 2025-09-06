@@ -1,10 +1,13 @@
 use std::path::Path;
 use bindings::sdk::{DbConnectionBuilder, __codegen::SpacetimeModule};
 use anyhow::Result;
+use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct Config {
+    webhook_url: String,
+    entity_name: HashMap<u64, String>,
     cluster_url: String,
     region:      String,
     token:       String,
@@ -27,6 +30,9 @@ impl Config {
     pub fn is_empty(&self) -> bool {
         self.cluster_url.is_empty() || self.region.is_empty() || self.token.is_empty()
     }
+
+    pub fn webhook_url(&self) -> String { self.webhook_url.clone() }
+    pub fn entity_name(&self) -> HashMap<u64, String> { self.entity_name.clone() }
 }
 
 pub trait Configurable {

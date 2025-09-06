@@ -2,11 +2,14 @@ mod config;
 mod data;
 use crate::{config::*, data::*};
 
+use std::collections::HashMap as StdHashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use bindings::region::{DbConnection, DbUpdate, SubscriptionHandle};
 use bindings::sdk::{DbContext, IntoQueries, SubscriptionHandle as SdkSubscriptionHandle};
 use hashbrown::{HashMap, HashSet};
+use itertools::Itertools;
+use serde_json::{json, Value};
 use tokio::sync::{mpsc::{unbounded_channel, UnboundedReceiver}, watch};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
@@ -21,6 +24,57 @@ struct Dungeon {
     players: HashSet<String>,
 }
 type DungeonMap = HashMap<u64, Dungeon>;
+
+impl DungeonState {
+    pub fn to_string(&self, players: bool) -> String {
+        match self {
+            DungeonState::Open if players => "active!".to_string(),
+            DungeonState::Open => "open!".to_string(),
+            DungeonState::Cleared(ts) => format!("clear, closing <t:{}:R>", ts / 1000),
+            DungeonState::Closed(ts) => format!("closed, opening <t:{}:R>", ts / 1000),
+        }
+    }
+    pub fn to_color(&self, players: bool) -> i32 {
+        match self {
+            DungeonState::Open if players => 5814783, // #58b9ff
+            DungeonState::Open => 8107618,            // #7bb662
+            DungeonState::Cleared(_) => 16765697,     // #ffd301
+            DungeonState::Closed(_) => 14032671,      // #d61f1f
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct Message {
+    title: String,
+    description: Option<String>,
+    color: i32,
+}
+impl Message {
+    pub fn for_dungeon(name: String, state: &Dungeon) -> Self {
+        let has_players = !state.players.is_empty();
+        Self {
+            title: format!("{} `[{}N {}E]` - {}",
+                           name,
+                           state.loc[1] / 3,
+                           state.loc[0] / 3,
+                           state.state.to_string(has_players)),
+            description: match has_players {
+                true => Some(format!("current players: `{}`", state.players.iter().join("`, `"))),
+                false => None,
+            },
+            color: state.state.to_color(has_players),
+        }
+    }
+    pub fn as_json(&self) -> Value {
+        match self.description {
+            Some(ref d) =>
+                json!({"title": self.title, "description": d, "color": self.color}),
+            None =>
+                json!({"title": self.title, "color": self.color})
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -54,18 +108,53 @@ async fn main() {
     };
 
     let (tx_post, rx_post) = watch::channel(Default::default());
-    let (exec, _, _, _) = spawn_threads(&ctx, rx, tx_post, rx_post);
+    let (exec, _, _, _) = spawn_threads(&ctx, rx, tx_post, rx_post, config.webhook_url(), config.entity_name());
 
     let _ = exec.await;
 }
 
-async fn post(mut rx: watch::Receiver<DungeonMap>) {
-    while let Ok(()) = rx.changed().await {
-        sleep(Duration::from_millis(500)).await;
-        let value = rx.borrow_and_update();
+async fn post(mut rx: watch::Receiver<DungeonMap>, webhook_url: String, entity_name: StdHashMap<u64, String>) {
+    let client = reqwest::Client::new();
+    let mut last = HashMap::new(); // last sent message per dungeon
 
-        for (id, dungeon) in value.iter() {
-            info!("{}: {:?}", id, dungeon)
+    while let Ok(()) = rx.changed().await {
+        let mut post = Vec::new();
+        sleep(Duration::from_millis(500)).await;
+
+        for (id, dungeon) in rx.borrow_and_update().iter() {
+            let name = entity_name.get(&id).map_or("Dungeon".to_string(), |n| n.clone());
+            let msg = Message::for_dungeon(name, dungeon);
+
+            if last.get(id).is_none_or(|m| *m != msg) {
+                post.push(msg.as_json());
+                last.insert(*id, msg);
+            }
+        }
+
+        info!("received event, updating {} dungeons", post.len());
+        if post.is_empty() {continue}
+
+        if webhook_url.is_empty() {
+            for e in post { info!("{:?}", e) }
+            continue;
+        }
+
+        let payload = json!({"embeds": post});
+        let response = client
+            .post(&webhook_url)
+            .header("Content-Type", "application/json")
+            .body(payload.to_string())
+            .send()
+            .await;
+
+        match response {
+            Ok(response) if !response.status().is_success() => {
+                error!("failed to post event: {:#?}", response);
+            }
+            Err(e) => {
+                error!("failed to post event: {:#?}", e);
+            }
+            _ => {}
         }
     }
 }
@@ -184,6 +273,8 @@ fn spawn_threads(
     rx: UnboundedReceiver<DbUpdate>,
     tx_post: watch::Sender<DungeonMap>,
     rx_post: watch::Receiver<DungeonMap>,
+    webhook_url: String,
+    entity_name: StdHashMap<u64, String>,
 ) -> (JoinHandle<()>, JoinHandle<()>, JoinHandle<()>, JoinHandle<()>) {(
     // database exec
     tokio::spawn({
@@ -199,7 +290,7 @@ fn spawn_threads(
     }),
     // poster task
     tokio::spawn({
-        post(rx_post)
+        post(rx_post, webhook_url, entity_name)
     }),
     // shutdown trigger
     tokio::spawn({
