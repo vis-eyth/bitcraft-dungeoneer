@@ -248,7 +248,8 @@ async fn consume(ctx: Arc<DbConnection>, mut rx: UnboundedReceiver<DbUpdate>, tx
                 }
                 if let Some(c) = contributions.get(&id) {
                     let mut c = c.iter().collect_vec();
-                    c.sort_by_key(|(_, v)| (*v * -100_f32) as i32);
+                    // inverted sort via total_cmp, highest value first
+                    c.sort_by(|(_, l), (_, r)| f32::total_cmp(r, l));
 
                     let sum = c.iter().map(|(_, v)| *v).sum::<f32>() / 100_f32;
                     let mut c = c.iter()
