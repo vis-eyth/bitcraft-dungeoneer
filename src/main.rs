@@ -3,11 +3,13 @@ mod data;
 use crate::{config::*, data::*};
 
 use std::sync::Arc;
+use std::time::Duration;
 use bindings::region::{DbConnection, DbUpdate, SubscriptionHandle};
 use bindings::sdk::{DbContext, IntoQueries, SubscriptionHandle as SdkSubscriptionHandle};
 use hashbrown::{HashMap, HashSet};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+use tokio::sync::{mpsc::{unbounded_channel, UnboundedReceiver}, watch};
 use tokio::task::JoinHandle;
+use tokio::time::sleep;
 use tracing::{error, info};
 
 #[derive(Debug, Clone, Copy)]
@@ -18,6 +20,7 @@ struct Dungeon {
     state: DungeonState,
     players: HashSet<String>,
 }
+type DungeonMap = HashMap<u64, Dungeon>;
 
 #[tokio::main]
 async fn main() {
@@ -49,12 +52,25 @@ async fn main() {
             return
         }
     };
-    let (exec, _, _) = spawn_threads(&ctx, rx);
+
+    let (tx_post, rx_post) = watch::channel(Default::default());
+    let (exec, _, _, _) = spawn_threads(&ctx, rx, tx_post, rx_post);
 
     let _ = exec.await;
 }
 
-async fn consume(ctx: Arc<DbConnection>, mut rx: UnboundedReceiver<DbUpdate>) {
+async fn post(mut rx: watch::Receiver<DungeonMap>) {
+    while let Ok(()) = rx.changed().await {
+        sleep(Duration::from_millis(500)).await;
+        let value = rx.borrow_and_update();
+
+        for (id, dungeon) in value.iter() {
+            info!("{}: {:?}", id, dungeon)
+        }
+    }
+}
+
+async fn consume(ctx: Arc<DbConnection>, mut rx: UnboundedReceiver<DbUpdate>, tx: watch::Sender<DungeonMap>) {
     let handle = subscribe(ctx.clone(), [
         "SELECT * FROM dungeon_state;",
         "SELECT p.* FROM portal_state p JOIN location_state l ON p.entity_id = l.entity_id;",
@@ -103,12 +119,7 @@ async fn consume(ctx: Arc<DbConnection>, mut rx: UnboundedReceiver<DbUpdate>) {
             }
         }
 
-        if dirty {
-            println!();
-            for dungeon in dungeons.values() {
-                info!("{:?}", dungeon);
-            }
-        }
+        if dirty { tx.send(dungeons.clone()).unwrap(); }
     }
 }
 
@@ -144,6 +155,8 @@ fn build_dungeons(update: DbUpdate) -> (HashMap<u64, Dungeon>, HashMap<u32, u64>
             dungeon.remove(&1);
         }
     }
+
+    info!("dungeons: {:?}", dungeons);
     info!("rooms: {:?}", rooms);
 
     // build dim -> dungeon lookup
@@ -166,8 +179,12 @@ fn subscribe<Queries: IntoQueries>(ctx: Arc<DbConnection>, queries: Queries) -> 
         .subscribe(queries)
 }
 
-fn spawn_threads(ctx: &Arc<DbConnection>, rx: UnboundedReceiver<DbUpdate>)
-    -> (JoinHandle<()>, JoinHandle<()>, JoinHandle<()>) {(
+fn spawn_threads(
+    ctx: &Arc<DbConnection>,
+    rx: UnboundedReceiver<DbUpdate>,
+    tx_post: watch::Sender<DungeonMap>,
+    rx_post: watch::Receiver<DungeonMap>,
+) -> (JoinHandle<()>, JoinHandle<()>, JoinHandle<()>, JoinHandle<()>) {(
     // database exec
     tokio::spawn({
         let ctx = ctx.clone();
@@ -178,7 +195,11 @@ fn spawn_threads(ctx: &Arc<DbConnection>, rx: UnboundedReceiver<DbUpdate>)
     // consumer task
     tokio::spawn({
         let ctx = ctx.clone();
-        consume(ctx, rx)
+        consume(ctx, rx, tx_post)
+    }),
+    // poster task
+    tokio::spawn({
+        post(rx_post)
     }),
     // shutdown trigger
     tokio::spawn({
