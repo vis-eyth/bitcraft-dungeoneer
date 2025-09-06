@@ -10,7 +10,7 @@ use bindings::sdk::{DbContext, IntoQueries, SubscriptionHandle as SdkSubscriptio
 use hashbrown::{HashMap, HashSet};
 use itertools::Itertools;
 use serde_json::{json, Value};
-use tokio::sync::{mpsc::{unbounded_channel, UnboundedReceiver}, watch};
+use tokio::sync::{mpsc::{unbounded_channel, UnboundedReceiver}, watch::{channel, Receiver, Sender}};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{error, info};
@@ -44,7 +44,7 @@ impl DungeonState {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 struct Message {
     title: String,
     description: Option<String>,
@@ -107,13 +107,13 @@ async fn main() {
         }
     };
 
-    let (tx_post, rx_post) = watch::channel(Default::default());
+    let (tx_post, rx_post) = channel(Default::default());
     let (exec, _, _, _) = spawn_threads(&ctx, rx, tx_post, rx_post, config.webhook_url(), config.entity_name());
 
     let _ = exec.await;
 }
 
-async fn post(mut rx: watch::Receiver<DungeonMap>, webhook_url: String, entity_name: StdHashMap<u64, String>) {
+async fn post(mut rx: Receiver<DungeonMap>, webhook_url: String, entity_name: StdHashMap<u64, String>) {
     let client = reqwest::Client::new();
     let mut last = HashMap::new(); // last sent message per dungeon
 
@@ -131,13 +131,14 @@ async fn post(mut rx: watch::Receiver<DungeonMap>, webhook_url: String, entity_n
             }
         }
 
-        info!("received event, updating {} dungeons", post.len());
-        if post.is_empty() {continue}
-
         if webhook_url.is_empty() {
-            for e in post { info!("{:?}", e) }
+            if post.is_empty() { info!("received event, no update")}
+            for e in post { info!("update: {:?}", e) }
             continue;
         }
+
+        info!("update: {} dungeons", post.len());
+        if post.is_empty() {continue}
 
         let payload = json!({"embeds": post});
         let response = client
@@ -159,7 +160,7 @@ async fn post(mut rx: watch::Receiver<DungeonMap>, webhook_url: String, entity_n
     }
 }
 
-async fn consume(ctx: Arc<DbConnection>, mut rx: UnboundedReceiver<DbUpdate>, tx: watch::Sender<DungeonMap>) {
+async fn consume(ctx: Arc<DbConnection>, mut rx: UnboundedReceiver<DbUpdate>, tx: Sender<DungeonMap>) {
     let handle = subscribe(ctx.clone(), [
         "SELECT * FROM dungeon_state;",
         "SELECT p.* FROM portal_state p JOIN location_state l ON p.entity_id = l.entity_id;",
@@ -271,8 +272,8 @@ fn subscribe<Queries: IntoQueries>(ctx: Arc<DbConnection>, queries: Queries) -> 
 fn spawn_threads(
     ctx: &Arc<DbConnection>,
     rx: UnboundedReceiver<DbUpdate>,
-    tx_post: watch::Sender<DungeonMap>,
-    rx_post: watch::Receiver<DungeonMap>,
+    tx_post: Sender<DungeonMap>,
+    rx_post: Receiver<DungeonMap>,
     webhook_url: String,
     entity_name: StdHashMap<u64, String>,
 ) -> (JoinHandle<()>, JoinHandle<()>, JoinHandle<()>, JoinHandle<()>) {(
