@@ -15,7 +15,7 @@ impl Into<Dungeon> for region::DungeonState {
             loc: [self.location.x, self.location.z],
             state: DungeonState::Closed(0),
             players: HashSet::new(),
-            boss: BossState::Alive(0),
+            boss: BossState::Alive(0, false),
         }
     }
 }
@@ -76,8 +76,8 @@ pub fn update_boss(boss: &mut BossState, new: BossState) -> bool {
     let old = replace(boss, new.clone());
     match (old, new) {
         (BossState::Dead(_), BossState::Dead(_)) => false,
-        (BossState::Alive(_), BossState::Alive(_)) => false,
-        (BossState::Fighting(_), BossState::Fighting(_)) => false,
+        (BossState::Alive(_, true), BossState::Alive(_, true)) => false,
+        (BossState::Alive(_, false), BossState::Alive(_, false)) => false,
         _ => true,
     }
 }

@@ -18,7 +18,7 @@ use tracing::{error, info};
 #[derive(Debug, Clone, Copy)]
 enum DungeonState { Open, Cleared(u64), Closed(u64) }
 #[derive(Debug, Clone)]
-enum BossState { Alive(u64), Fighting(u64), Dead(Vec<String>) }
+enum BossState { Alive(u64, bool), Dead(Vec<String>) }
 #[derive(Debug, Clone)]
 struct Dungeon {
     loc: [i32; 2],
@@ -48,12 +48,6 @@ impl DungeonState {
         }
     }
 }
-impl BossState {
-    fn alive(id: u64, fighting: bool) -> Self {
-        if fighting { BossState::Fighting(id) }
-        else { BossState::Alive(id) }
-    }
-}
 impl Dungeon {
     fn skip_message(&self) -> bool {
         matches!(self.state, DungeonState::Cleared(_)) && !matches!(self.boss, BossState::Dead(_))
@@ -68,7 +62,7 @@ struct Message {
 }
 impl Message {
     pub fn for_dungeon(name: String, state: &Dungeon) -> Self {
-        let boss = matches!(&state.boss, BossState::Fighting(_));
+        let boss = matches!(&state.boss, BossState::Alive(_, true));
         let active = !state.players.is_empty();
 
         Self {
@@ -245,7 +239,7 @@ async fn consume(ctx: Arc<DbConnection>, mut rx: UnboundedReceiver<DbUpdate>, tx
                     dirty |= dungeon.players.insert(name.clone());
                 }
                 if let Some(c) = bosses.get(&id) {
-                    dirty |= update_boss(&mut dungeon.boss, BossState::alive(id, !c.is_empty()));
+                    dirty |= update_boss(&mut dungeon.boss, BossState::Alive(id, !c.is_empty()));
                 }
             }
             for id in changes.delete {
@@ -270,13 +264,12 @@ async fn consume(ctx: Arc<DbConnection>, mut rx: UnboundedReceiver<DbUpdate>, tx
 
         for dungeon in dungeons.values_mut() {
             let id = match dungeon.boss {
-                BossState::Alive(id) => id,
-                BossState::Fighting(id) => id,
+                BossState::Alive(id, _) => id,
                 BossState::Dead(_) => {continue},
             };
 
             if let Some(c) = bosses.get_mut(&id) {
-                dirty |= update_boss(&mut dungeon.boss, BossState::alive(id, !c.is_empty()));
+                dirty |= update_boss(&mut dungeon.boss, BossState::Alive(id, !c.is_empty()));
             }
         }
 
