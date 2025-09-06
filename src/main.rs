@@ -76,7 +76,7 @@ impl Message {
                            state.state.title(active, boss)),
             description: match (&state.boss, &state.state, active) {
                 (BossState::Dead(contrib), DungeonState::Cleared(_), _) =>
-                    Some(format!("player contribution:\n{}", contrib.iter().join("\n"))),
+                    Some(format!("boss contribution:\n{}", contrib.iter().join("\n"))),
                 (_, _, true) =>
                     Some(format!("current players: `{}`", state.players.iter().join("`, `"))),
                 _ =>
