@@ -5,7 +5,7 @@ use crate::{config::*, data::*};
 use std::collections::HashMap as StdHashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use bindings::region::{DbConnection, DbUpdate, SubscriptionHandle};
+use bindings::region::{DbConnection, DbUpdate, EnemyType, SubscriptionHandle};
 use bindings::sdk::{DbContext, IntoQueries, SubscriptionHandle as SdkSubscriptionHandle};
 use hashbrown::{HashMap, HashSet};
 use itertools::Itertools;
@@ -18,29 +18,45 @@ use tracing::{error, info};
 #[derive(Debug, Clone, Copy)]
 enum DungeonState { Open, Cleared(u64), Closed(u64) }
 #[derive(Debug, Clone)]
+enum BossState { Alive(u64), Fighting(u64), Dead(Vec<String>) }
+#[derive(Debug, Clone)]
 struct Dungeon {
     loc: [i32; 2],
     state: DungeonState,
     players: HashSet<String>,
+    boss: BossState,
 }
 type DungeonMap = HashMap<u64, Dungeon>;
 
 impl DungeonState {
-    pub fn to_string(&self, players: bool) -> String {
+    pub fn title(&self, active: bool, boss: bool) -> String {
         match self {
-            DungeonState::Open if players => "active!".to_string(),
+            DungeonState::Open if boss => "boss fight!".to_string(),
+            DungeonState::Open if active => "active!".to_string(),
             DungeonState::Open => "open!".to_string(),
             DungeonState::Cleared(ts) => format!("clear, closing <t:{}:R>", ts / 1000),
             DungeonState::Closed(ts) => format!("closed, opening <t:{}:R>", ts / 1000),
         }
     }
-    pub fn to_color(&self, players: bool) -> i32 {
+    pub fn color(&self, active: bool, boss: bool) -> i32 {
         match self {
-            DungeonState::Open if players => 5814783, // #58b9ff
-            DungeonState::Open => 8107618,            // #7bb662
-            DungeonState::Cleared(_) => 16765697,     // #ffd301
-            DungeonState::Closed(_) => 14032671,      // #d61f1f
+            DungeonState::Open if boss => 14364802,  // #db3082
+            DungeonState::Open if active => 5814783, // #58b9ff
+            DungeonState::Open => 8107618,           // #7bb662
+            DungeonState::Cleared(_) => 16765697,    // #ffd301
+            DungeonState::Closed(_) => 14032671,     // #d61f1f
         }
+    }
+}
+impl BossState {
+    fn alive(id: u64, fighting: bool) -> Self {
+        if fighting { BossState::Fighting(id) }
+        else { BossState::Alive(id) }
+    }
+}
+impl Dungeon {
+    fn skip_message(&self) -> bool {
+        matches!(self.state, DungeonState::Cleared(_)) && !matches!(self.boss, BossState::Dead(_))
     }
 }
 
@@ -52,18 +68,21 @@ struct Message {
 }
 impl Message {
     pub fn for_dungeon(name: String, state: &Dungeon) -> Self {
-        let has_players = !state.players.is_empty();
+        let boss = matches!(&state.boss, BossState::Fighting(_));
+        let active = !state.players.is_empty();
+
         Self {
-            title: format!("{} `[{}N {}E]` - {}",
-                           name,
-                           state.loc[1] / 3,
-                           state.loc[0] / 3,
-                           state.state.to_string(has_players)),
-            description: match has_players {
-                true => Some(format!("current players: `{}`", state.players.iter().join("`, `"))),
-                false => None,
+            title: format!("{} `[{}N {}E]` - {}", name, state.loc[1] / 3, state.loc[0] / 3,
+                           state.state.title(active, boss)),
+            description: match (&state.boss, &state.state, active) {
+                (BossState::Dead(contrib), DungeonState::Cleared(_), _) =>
+                    Some(format!("player contribution:\n{}", contrib.iter().join("\n"))),
+                (_, _, true) =>
+                    Some(format!("current players: `{}`", state.players.iter().join("`, `"))),
+                _ =>
+                    None,
             },
-            color: state.state.to_color(has_players),
+            color: state.state.color(active, boss),
         }
     }
     pub fn as_json(&self) -> Value {
@@ -122,6 +141,8 @@ async fn post(mut rx: Receiver<DungeonMap>, webhook_url: String, entity_name: St
         sleep(Duration::from_millis(500)).await;
 
         for (id, dungeon) in rx.borrow_and_update().iter() {
+            if dungeon.skip_message() {continue}
+
             let name = entity_name.get(&id).map_or("Dungeon".to_string(), |n| n.clone());
             let msg = Message::for_dungeon(name, dungeon);
 
@@ -176,12 +197,15 @@ async fn consume(ctx: Arc<DbConnection>, mut rx: UnboundedReceiver<DbUpdate>, tx
         "SELECT * FROM player_username_state;".to_string(),
         "SELECT n.* FROM dimension_network_state n JOIN dungeon_state d ON n.entity_id = d.entity_id;".to_string(),
     ];
-    for dim in lookup.keys() {
-        queries.push(format!("SELECT * FROM mobile_entity_state WHERE dimension = {};", dim))
-    }
+    for dim in lookup.keys() { queries.extend([
+        format!("SELECT * FROM mobile_entity_state WHERE dimension = {};", dim),
+        format!("SELECT e.* FROM enemy_state e JOIN mobile_entity_state m ON e.entity_id = m.entity_id WHERE m.dimension = {};", dim),
+        format!("SELECT c.* FROM contribution_state c JOIN mobile_entity_state m ON c.enemy_entity_id = m.entity_id WHERE m.dimension = {};", dim),
+    ]) }
     subscribe(ctx.clone(), queries);
 
     let mut players = HashMap::new();
+    let mut bosses = HashMap::new();
     while let Some(update) = rx.recv().await {
         let mut dirty = false;
 
@@ -196,16 +220,63 @@ async fn consume(ctx: Arc<DbConnection>, mut rx: UnboundedReceiver<DbUpdate>, tx
             dirty = true;
         }
 
+        let mut contributions = HashMap::new();
+        for e in update.enemy_state.inserts {
+            if !matches!(e.row.enemy_type, EnemyType::Sentinel) {continue};
+            bosses.entry(e.row.entity_id).or_insert_with(HashMap::new);
+        }
+        for e in update.contribution_state.deletes {
+            let Some(boss) = bosses.get_mut(&e.row.enemy_entity_id) else {continue};
+            boss.remove(&e.row.player_entity_id);
+
+            contributions.entry(e.row.enemy_entity_id).or_insert_with(HashMap::new)
+                .insert(e.row.player_entity_id, e.row.contribution);
+        }
+        for e in update.contribution_state.inserts {
+            let Some(boss) = bosses.get_mut(&e.row.enemy_entity_id) else {continue};
+            boss.insert(e.row.player_entity_id, e.row.contribution);
+        }
+
         for (dungeon, changes) in entity_loc(update.mobile_entity_state, &lookup) {
             let dungeon = dungeons.get_mut(&dungeon).unwrap();
 
             for id in changes.insert {
-                let Some(name) = players.get(&id) else {continue};
-                dirty |= dungeon.players.insert(name.clone());
+                if let Some(name) = players.get(&id) {
+                    dirty |= dungeon.players.insert(name.clone());
+                }
+                if let Some(c) = bosses.get(&id) {
+                    dirty |= update_boss(&mut dungeon.boss, BossState::alive(id, !c.is_empty()));
+                }
             }
             for id in changes.delete {
-                let Some(name) = players.get(&id) else {continue};
-                dirty |= dungeon.players.remove(name);
+                if let Some(name) = players.get(&id) {
+                    dirty |= dungeon.players.remove(name);
+                }
+                if let Some(c) = contributions.get(&id) {
+                    let mut c = c.iter().collect_vec();
+                    c.sort_by_key(|(_, v)| **v as i32);
+                    c.reverse();
+
+                    let sum = c.iter().map(|(_, v)| *v).sum::<f32>() / 100_f32;
+                    let c = c.iter()
+                        .map(|(id, v)| format!("- `{}`: `{:.1}%`", players.get(*id).unwrap(), **v / sum))
+                        .collect_vec();
+
+                    dirty |= update_boss(&mut dungeon.boss, BossState::Dead(c));
+                    bosses.remove(&id);
+                }
+            }
+        }
+
+        for dungeon in dungeons.values_mut() {
+            let id = match dungeon.boss {
+                BossState::Alive(id) => id,
+                BossState::Fighting(id) => id,
+                BossState::Dead(_) => {continue},
+            };
+
+            if let Some(c) = bosses.get_mut(&id) {
+                dirty |= update_boss(&mut dungeon.boss, BossState::alive(id, !c.is_empty()));
             }
         }
 

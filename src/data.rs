@@ -1,3 +1,4 @@
+use std::mem::replace;
 use hashbrown::{HashMap, HashSet};
 use bindings::{region, sdk::__codegen::TableUpdate};
 use crate::*;
@@ -14,6 +15,7 @@ impl Into<Dungeon> for region::DungeonState {
             loc: [self.location.x, self.location.z],
             state: DungeonState::Closed(0),
             players: HashSet::new(),
+            boss: BossState::Alive(0),
         }
     }
 }
@@ -68,4 +70,14 @@ pub fn entity_loc(update: TableUpdate<region::MobileEntityState>, cache: &HashMa
     }
 
     result
+}
+
+pub fn update_boss(boss: &mut BossState, new: BossState) -> bool {
+    let old = replace(boss, new.clone());
+    match (old, new) {
+        (BossState::Dead(_), BossState::Dead(_)) => false,
+        (BossState::Alive(_), BossState::Alive(_)) => false,
+        (BossState::Fighting(_), BossState::Fighting(_)) => false,
+        _ => true,
+    }
 }
