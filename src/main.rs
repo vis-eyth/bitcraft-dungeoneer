@@ -248,12 +248,11 @@ async fn consume(ctx: Arc<DbConnection>, mut rx: UnboundedReceiver<DbUpdate>, tx
                 }
                 if let Some(c) = contributions.get(&id) {
                     let mut c = c.iter().collect_vec();
-                    c.sort_by_key(|(_, v)| **v as i32);
-                    c.reverse();
+                    c.sort_by_key(|(_, v)| (*v * -1_f32) as i32);
 
                     let sum = c.iter().map(|(_, v)| *v).sum::<f32>() / 100_f32;
                     let c = c.iter()
-                        .map(|(id, v)| format!("- `{}`: `{:.1}%`", players.get(*id).unwrap(), **v / sum))
+                        .map(|(id, v)| format!("- `{}`: `{:.1}%`", players.get(*id).unwrap(), *v / sum))
                         .collect_vec();
 
                     dirty |= update_boss(&mut dungeon.boss, BossState::Dead(c));
