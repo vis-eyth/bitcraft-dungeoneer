@@ -1,10 +1,11 @@
 mod config;
-use config::{Config, Configurable};
+mod data;
+use crate::{config::*, data::*};
 
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use bindings::region::{DbConnection, DbUpdate, SubscriptionHandle};
 use bindings::sdk::{DbContext, IntoQueries, SubscriptionHandle as SdkSubscriptionHandle};
+use hashbrown::{HashMap, HashSet};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tokio::task::JoinHandle;
 use tracing::{error, info};
@@ -85,37 +86,28 @@ async fn consume(ctx: Arc<DbConnection>, mut rx: UnboundedReceiver<DbUpdate>) {
     while let Some(update) = rx.recv().await {
         let mut dirty = false;
 
-        for e in update.dimension_network_state.inserts {
-            let dungeon = dungeons.get_mut(&e.row.entity_id).unwrap();
-            dungeon.state = match (e.row.collapse_respawn_timestamp, e.row.is_collapsed) {
-                (0, false) => DungeonState::Open,
-                (n, false) => DungeonState::Cleared(n),
-                (n, true) => DungeonState::Closed(n),
-            };
-
-            dirty = true;
-        }
-
         for e in update.player_username_state.inserts {
             players.insert(e.row.entity_id, e.row.username);
         }
 
-        let mut deletes = HashSet::new();
-        for e in update.mobile_entity_state.deletes {
-            let Some(dungeon) = lookup.get(&e.row.dimension) else {continue};
-            deletes.insert((e.row.entity_id, dungeon));
-        }
-        for e in update.mobile_entity_state.inserts {
-            let Some(dungeon) = lookup.get(&e.row.dimension) else {continue};
-            let Some(name) = players.get(&e.row.entity_id) else {continue};
+        for e in update.dimension_network_state.inserts {
+            let id = e.row.entity_id;
+            dungeons.get_mut(&id).unwrap().state = e.row.into();
 
-            if !deletes.remove(&(e.row.entity_id, dungeon)) {
-                dirty |= dungeons.get_mut(dungeon).unwrap().players.insert(name.clone());
-            }
+            dirty = true;
         }
-        for (id, dungeon) in deletes {
-            let Some(name) = players.get(&id) else {continue};
-            dungeons.get_mut(dungeon).unwrap().players.remove(name);
+
+        for (dungeon, changes) in entity_loc(update.mobile_entity_state, &lookup) {
+            let dungeon = dungeons.get_mut(&dungeon).unwrap();
+
+            for id in changes.insert {
+                let Some(name) = players.get(&id) else {continue};
+                dirty |= dungeon.players.insert(name.clone());
+            }
+            for id in changes.delete {
+                let Some(name) = players.get(&id) else {continue};
+                dirty |= dungeon.players.remove(name);
+            }
         }
 
         if dirty {
@@ -128,45 +120,25 @@ async fn consume(ctx: Arc<DbConnection>, mut rx: UnboundedReceiver<DbUpdate>) {
 }
 
 fn build_dungeons(update: DbUpdate) -> (HashMap<u64, Dungeon>, HashMap<u32, u64>) {
-    let mut dungeons = HashMap::new();
     let mut rooms = HashMap::new();
+    let mut dungeons = HashMap::<u64, Dungeon>::new();
 
     // fill dungeons
     for e in update.dungeon_state.inserts {
-        dungeons.insert(e.row.entity_id, Dungeon {
-            loc: [e.row.location.x, e.row.location.z],
-            state: DungeonState::Closed(0),
-            players: HashSet::new(),
-        });
-        rooms.insert(e.row.entity_id, HashSet::new());
+        let id = e.row.entity_id;
+        rooms.insert(id, HashSet::new());
+        dungeons.insert(id, e.row.into());
     }
 
     // fill state, add starting room
     for e in update.dimension_network_state.inserts {
-        let dungeon = dungeons.get_mut(&e.row.entity_id).unwrap();
-        dungeon.state = match (e.row.collapse_respawn_timestamp, e.row.is_collapsed) {
-            (0, false) => DungeonState::Open,
-            (n, false) => DungeonState::Cleared(n),
-            (n, true) => DungeonState::Closed(n),
-        };
-
-        let rooms = rooms.get_mut(&e.row.entity_id).unwrap();
-        rooms.insert(e.row.entrance_dimension_id);
+        let id = e.row.entity_id;
+        rooms.get_mut(&id).unwrap().insert(e.row.entrance_dimension_id);
+        dungeons.get_mut(&id).unwrap().state = e.row.into();
     }
 
     // build portal connections for source dim -> target dim
-    let mut portals = HashMap::new();
-    let mut dimensions = HashMap::new();
-
-    for e in update.location_state.inserts {
-        dimensions.insert(e.row.entity_id, e.row.dimension);
-    }
-    for e in update.portal_state.inserts {
-        let from = dimensions.get(&e.row.entity_id).unwrap();
-        portals.entry(*from)
-            .or_insert_with(HashSet::new)
-            .insert(e.row.destination_dimension);
-    }
+    let portals = portals(update.location_state, update.portal_state);
 
     // find all reachable dimensions (except for overworld) for each dungeon
     for dungeon in rooms.values_mut() {
@@ -174,13 +146,12 @@ fn build_dungeons(update: DbUpdate) -> (HashMap<u64, Dungeon>, HashMap<u32, u64>
         while dungeon.len() != size {
             size = dungeon.len();
             for room in dungeon.clone() {
-                for next in portals.get(&room).unwrap() {
-                    dungeon.insert(*next);
-                }
+                dungeon.extend(portals.get(&room).unwrap());
             }
             dungeon.remove(&1);
         }
     }
+    info!("rooms: {:?}", rooms);
 
     // build dim -> dungeon lookup
     let mut lookup = HashMap::new();
