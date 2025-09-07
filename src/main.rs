@@ -70,7 +70,7 @@ impl Message {
                            state.state.title(active, boss)),
             description: match (&state.boss, &state.state, active) {
                 (BossState::Dead(contrib), DungeonState::Cleared(_), _) =>
-                    Some(format!("**`Player                   Contribution   `**\n{}", contrib.iter().join("\n"))),
+                    Some(format!("**`Player                   Contribution         `**\n{}", contrib.iter().join("\n"))),
                 (_, _, true) =>
                     Some(format!("current players: `{}`", state.players.iter().join("`, `"))),
                 _ =>
@@ -254,10 +254,12 @@ async fn consume(ctx: Arc<DbConnection>, mut rx: UnboundedReceiver<DbUpdate>, tx
                     let sum = c.iter().map(|(_, v)| *v).sum::<f32>() / 100_f32;
                     let mut c = c.iter()
                         .map(|(id, v)|
-                            format!("`{:<25} {:.2} ({:.1})%`",
-                                    format!("{}:", players.get(*id).unwrap()), **v, *v / sum))
+                            format!("`{name:<28}  {abs:>7.2} {pct:>8}`",
+                                    name=players.get(*id).unwrap(),
+                                    abs=**v,
+                                    pct=format!("({:.1}%)", *v / sum)))
                         .collect_vec();
-                    c.push(format!("**`Total:                   {:.2}        `**", sum * 100_f32));
+                    c.push(format!("**`Total:                        {:>7.2}         `**", sum * 100_f32));
 
                     dirty |= update_boss(&mut dungeon.boss, BossState::Dead(c));
                     bosses.remove(&id);
